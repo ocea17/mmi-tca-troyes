@@ -99,4 +99,3 @@ jobs:
             php bin/console cache:warmup --env=prod
             sudo systemctl restart apache2
           EOF
-
