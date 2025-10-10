@@ -1,0 +1,101 @@
+name: Symfony CI/CD
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "ressources/s5/oceane-le/projets/ci-cd-symfony/**"
+      - ".github/**"
+
+defaults:
+  run:
+    working-directory: ressources/s5/oceane-le/projets/ci-cd-symfony
+
+jobs:
+  ci-symfony:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: "8.2"
+          coverage: pcov
+
+      - name: Install dependencies
+        run: composer install --no-progress --prefer-dist --no-scripts
+
+      - name: Run PHP-CS-Fixer
+        run: ./vendor/bin/php-cs-fixer fix --dry-run --diff
+
+      - name: Run PHP lint
+        run: find src tests -name "*.php" -exec php -l {} \;
+
+      - name: Run PHPStan
+        run: ./vendor/bin/phpstan analyse
+
+      - name: Run PHPUnit
+        run: ./vendor/bin/phpunit --coverage-text --coverage-clover=coverage.xml
+
+      - name: Audit de sécurité
+        run: composer audit --format=json --no-interaction
+        continue-on-error: true
+
+      - name: Dump environment variables for production
+        run: composer dump-env prod
+        env:
+          APP_ENV: prod
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+
+      - name: Create deployment archive
+        run: tar -czvf symfony-artifact-r1.tar.gz .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: symfony-artifact-r1
+          path: ressources/s5/oceane-le/projets/ci-cd-symfony/symfony-artifact-r1.tar.gz
+
+  deploy-to-server:
+    needs: ci-symfony
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: .
+
+    steps:
+      - name: Download Symfony artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: symfony-artifact-r1
+
+      - name: Setup SSH key
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.SSH_KEY }}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          eval "$(ssh-agent -s)"
+          ssh-add ~/.ssh/id_ed25519
+          ssh-keyscan -H ${{ secrets.SSH_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Test SSH connection
+        run: ssh -o StrictHostKeyChecking=no ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} "echo :white_check_mark: SSH connection successful"
+
+      - name: Copy artifact to server via SCP
+        run: scp symfony-artifact-r1.tar.gz ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }}:/var/www/my-app/
+
+      - name: Deploy Artifact on remote server
+        run: |
+          ssh ${{ secrets.SSH_USER }}@${{ secrets.SSH_HOST }} << 'EOF'
+            cd /var/www/my-app/
+            tar -xvf symfony-artifact-r1.tar.gz
+            rm symfony-artifact-r1.tar.gz
+            composer install --no-dev --optimize-autoloader --ignore-platform-reqs
+            php bin/console doctrine:migrations:migrate --no-interaction
+            php bin/console cache:clear --env=prod
+            php bin/console cache:warmup --env=prod
+            sudo systemctl restart apache2
+          EOF
